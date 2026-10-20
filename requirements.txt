@@ -1,0 +1,12 @@
+deepagents
+langchain-ollama
+langchain-groq
+langchain-anthropic
+langchain-google-genai
+langchain-openai
+python-dotenv
+pypdf
+pdfplumber
+pypdfium2
+pillow
+python-pptx

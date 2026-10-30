@@ -1,4 +1,4 @@
-"""Extract text (with headings) and embedded images from a PDF into content.json."""
+"""Extract text (with headings), tables and embedded images from a PDF into content.json."""
 import hashlib
 import io
 import json
@@ -13,6 +13,8 @@ from pypdf import PdfReader
 
 MIN_IMG_SIDE = 100      # px, skip icons/bullets smaller than this
 MIN_IMG_BYTES = 2500
+MAX_TABLE_ROWS = 60
+MAX_CELL_CHARS = 300
 BULLET_RE = re.compile(r"^\s*([\u2022\u25CF\u25AA\u25E6\u2023\u2043\-\*\u2013]|\d+[.)])\s+")
 
 
@@ -20,9 +22,51 @@ def _norm(t):
     return re.sub(r"\d+", "#", t.strip())
 
 
-def _lines(page):
-    """Group words into lines with their font size."""
+def _inside(o, boxes):
+    """True if the center of object o lies inside one of the boxes (x0, top, x1, bottom)."""
+    cx = (o["x0"] + o["x1"]) / 2
+    cy = (o["top"] + o["bottom"]) / 2
+    return any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in boxes)
+
+
+def _tables(page):
+    """Real tables of the page as lists of rows, plus their boxes (to remove them from the text)."""
+    out, boxes = [], []
+    try:
+        found = page.find_tables()
+    except Exception:
+        return out, boxes
+    for t in found:
+        try:
+            raw = t.extract()
+        except Exception:
+            continue
+        rows = []
+        for r in raw or []:
+            cells = [re.sub(r"\s+", " ", (c or "")).strip()[:MAX_CELL_CHARS] for c in r]
+            if any(cells):
+                rows.append(cells)
+        if not rows:
+            continue
+        ncol = max(len(r) for r in rows)
+        rows = [r + [""] * (ncol - len(r)) for r in rows]
+        keep = [j for j in range(ncol) if any(r[j] for r in rows)]   # drop empty columns
+        rows = [[r[j] for j in keep] for r in rows][:MAX_TABLE_ROWS]
+        if len(rows) < 2 or len(keep) < 2:
+            continue
+        filled = sum(1 for r in rows for c in r if c) / (len(rows) * len(keep))
+        if filled < 0.5:        # a grid of decorative boxes, not a table
+            continue
+        out.append(rows)
+        boxes.append(t.bbox)
+    return out, boxes
+
+
+def _lines(page, boxes=()):
+    """Group words into lines with their font size (words inside tables are skipped)."""
     words = page.extract_words(extra_attrs=["size"], keep_blank_chars=False, use_text_flow=False)
+    if boxes:
+        words = [w for w in words if not _inside(w, boxes)]
     words.sort(key=lambda w: (round(w["top"] / 3), w["x0"]))
     lines, cur = [], []
     for w in words:
@@ -114,9 +158,11 @@ def _save_images(reader, pdf, doc_dir, hash_pages):
     return result
 
 
-def _render_vector_figure(page, doc_dir, pno):
-    """Fallback: crop vector drawings (charts/diagrams) to a PNG."""
+def _render_vector_figure(page, doc_dir, pno, boxes=()):
+    """Fallback: crop vector drawings (charts/diagrams) to a PNG. Table borders are ignored."""
     objs = list(page.rects) + list(page.curves) + list(page.lines)
+    if boxes:
+        objs = [o for o in objs if not _inside(o, boxes)]
     if len(objs) < 25:
         return None
     x0 = max(min(o["x0"] for o in objs), 0)
@@ -144,17 +190,17 @@ def extract(pdf_path, work_dir):
     pages, all_lines = [], []
     with pdfplumber.open(str(pdf_path)) as pdf:
         for pi, page in enumerate(pdf.pages):
-            lines = _lines(page)
-            all_lines.append((page, lines))
+            tables, boxes = _tables(page)
+            all_lines.append((_lines(page, boxes), tables, boxes))
     # repeated header/footer lines
     counter = Counter()
-    for _, lines in all_lines:
+    for lines, _, _ in all_lines:
         for t in {_norm(l["text"]) for l in lines}:
             counter[t] += 1
     repeated = {t for t, c in counter.items() if n_pages >= 4 and c > max(3, n_pages * 0.4)}
 
     with pdfplumber.open(str(pdf_path)) as pdf:
-        for pi, (_, lines) in enumerate(all_lines):
+        for pi, (lines, tables, boxes) in enumerate(all_lines):
             page = pdf.pages[pi]
             lines = [l for l in lines if _norm(l["text"]) not in repeated and not re.fullmatch(r"\d{1,3}", l["text"])]
             sizes = [l["size"] for l in lines for _ in range(max(1, len(l["text"]) // 10))]
@@ -176,7 +222,7 @@ def extract(pdf_path, work_dir):
             imgs = images.get(pi, [])
             if not imgs:
                 try:
-                    v = _render_vector_figure(page, work_dir, pi + 1)
+                    v = _render_vector_figure(page, work_dir, pi + 1, boxes)
                 except Exception:
                     v = None
                 if v:
@@ -185,7 +231,7 @@ def extract(pdf_path, work_dir):
             if caption:
                 paras.remove(caption)
             pages.append({"page": pi + 1, "heading": heading, "paragraphs": paras,
-                          "caption": caption[:120], "images": imgs})
+                          "caption": caption[:120], "images": imgs, "tables": tables})
 
     # drop logos/watermarks that repeat on many pages
     for p in pages:
@@ -205,7 +251,7 @@ def summary(data, max_chars=110):
     for p in data["pages"]:
         first = (p["paragraphs"][0][:max_chars] if p["paragraphs"] else "")
         imgs = ",".join(Path(i["path"]).name for i in p["images"])
-        out.append(f"p{p['page']}: [{p['heading'][:60]}] {first} | imgs: {imgs or '-'}")
+        out.append(f"p{p['page']}: [{p['heading'][:60]}] {first} | imgs: {imgs or '-'} | tables: {len(p.get('tables', []))}")
     return "\n".join(out)
 
 

@@ -1,5 +1,7 @@
 import os
 
+import httpx
+
 # What differs between providers: LangChain's name for it, the environment variable
 # that holds its API key (None = no key), and the pip package it needs.
 PROVIDERS = {
@@ -37,7 +39,10 @@ def build_chat_model(provider, model, api_key=None):
 
     if provider == "ollama":
         from langchain_ollama import ChatOllama
-        return ChatOllama(model=model, temperature=0)
+        base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        client_kwargs = {"transport": httpx.HTTPTransport(local_address="0.0.0.0")}
+        return ChatOllama(model=model, temperature=0, base_url=base_url,
+                          client_kwargs=client_kwargs)
 
     from langchain.chat_models import init_chat_model
     try:

@@ -2,50 +2,81 @@ import os
 import sys
 from dotenv import load_dotenv
 from deepagents import create_deep_agent
-from deepagents.backends import LocalShellBackend
-from langchain_ollama import ChatOllama
 from llm_factory import build_chat_model
+from security import RestrictedShellBackend
 
-load_dotenv()
-
-PDF = sys.argv[1] if len(sys.argv) > 1 else "inputs/Multi-Agent Systems.pdf"
-OUT = sys.argv[2] if len(sys.argv) > 2 else "outputs/deep_agent.pptx"
-
-PROMPT = f"""Convert the PDF into a summarized PowerPoint with images.
-Step 1: run exactly this command with the execute tool and wait for it to finish:
-python skills/pdf-pptx-skill/scripts/process_pdf.py "{PDF}" "{OUT}" --summarize
-Step 2: run exactly this check:
-python -c "from pptx import Presentation; p=Presentation('{OUT}'); print(len(p.slides), 'slides,', sum(1 for s in p.slides for sh in s.shapes if sh.shape_type==13), 'pictures')"
-Step 3: report the last line of step 1 and the output of step 2. Do not run anything else."""
-
-SYSTEM = """You are a presentation expert on Windows PowerShell.
-Read skills/pdf-pptx-skill/SKILL.md first and run the command it gives, exactly as written.
-Always put file paths between double quotes. Use "python", not "python3".
+SYSTEM = """You convert PDFs into PowerPoint files. You run commands in a Linux shell.
+Follow the steps in the user message exactly.
+Only these commands exist: process_pdf.py (as given in the steps) and nothing else.
+Never use pdftoppm, pandoc, libreoffice, pip or any other tool. If a command is rejected, do not try alternatives: stop and report the error.
+Always put file paths between double quotes.
 Do not write your own scripts and do not give manual instructions: execute the commands yourself.
-Do not use "mkdir -p" or other Linux-only commands. The folder outputs/ already exists.
-If a Python library is missing, run the pip install line from SKILL.md once, then rerun the command.
+The folder outputs/ already exists. Libraries are already installed.
 Keep tool outputs short and finish after the file is created."""
 
-backend = LocalShellBackend(
-    root_dir=os.getcwd(),
-    virtual_mode=True,
-    inherit_env=True,
-)
+
+def build_prompt(pdf, out, summarize):
+    if not summarize:
+        return f"""Convert the PDF into a PowerPoint with images.
+You MUST call the execute tool. Never claim success without running the command.
+Keep the double quotes around both paths exactly as written. Do not remove them.
+Step 1: call execute with this exact command and wait for it to finish:
+python skills/pdf-pptx-skill/scripts/process_pdf.py "{pdf}" "{out}"
+Step 2: report the last line of the output. If it failed, report the error. Do not run anything else."""
+
+    # Same prompt for EVERY provider: the summarizing happens inside the script,
+    # using the model the user selected, so the result does not depend on the agent model.
+    return f"""Convert the PDF into a summarized PowerPoint with images.
+You MUST call the execute tool. Never claim success without running the command.
+Keep the double quotes around both paths exactly as written.
+Step 1: call execute with this exact command and wait for it to finish:
+python skills/pdf-pptx-skill/scripts/process_pdf.py "{pdf}" "{out}" --summarize
+Step 2: report the last line of the output. If it failed, report the error. Do not run anything else.
+Copy the command character by character. Do NOT add quotes around the script path. Quotes are only around the two file paths, exactly as shown."""
 
 
-model = build_chat_model(os.getenv("LLM_PROVIDER"), os.getenv("LLM_MODEL"), api_key=os.getenv("LLM_API_KEY"))
+def run_agent(provider, model_name, api_key, pdf, out, summarize=True):
+    prompt = build_prompt(pdf, out, summarize)
 
-agent = create_deep_agent(
-    model=model,
-    backend=backend,
-    skills=["skills/pdf-pptx-skill"],
-    system_prompt=SYSTEM,
-)
+    # The script (not the agent) needs to know which model to use for summarizing.
+    env = {
+        "PATH": os.environ["PATH"],
+        "SUM_PROVIDER": provider or "",
+        "SUM_MODEL": model_name or "",
+    }
+    for k in ("SYSTEMROOT", "OLLAMA_BASE_URL"):  # SYSTEMROOT is needed by Python/SSL on Windows
+        if os.environ.get(k):
+            env[k] = os.environ[k]
+    if api_key and provider != "ollama":
+        env["SUM_API_KEY"] = api_key
+
+    backend = RestrictedShellBackend(
+        root_dir=os.getcwd(),
+        virtual_mode=True,
+        inherit_env=False,
+        env=env,
+    )
+    model = build_chat_model(provider, model_name, api_key=api_key)
+
+    agent = create_deep_agent(
+        model=model,
+        backend=backend,
+        skills=["skills/pdf-pptx-skill"],
+        system_prompt=SYSTEM,
+    )
+    for step in agent.stream(
+        {"messages": [{"role": "user", "content": prompt}]},
+        stream_mode="values",
+    ):
+        yield step["messages"][-1]
 
 
 if __name__ == "__main__":
-    for step in agent.stream(
-        {"messages": [{"role": "user", "content": PROMPT}]},
-        stream_mode="values",
+    load_dotenv()
+    if len(sys.argv) < 3:
+        sys.exit('Usage: python agent.py "inputs/file.pdf" "outputs/file.pptx" [--summarize]')
+    for msg in run_agent(
+        os.getenv("LLM_PROVIDER"), os.getenv("LLM_MODEL"), os.getenv("LLM_API_KEY"),
+        sys.argv[1], sys.argv[2], summarize="--summarize" in sys.argv,
     ):
-        step["messages"][-1].pretty_print()
+        msg.pretty_print()
